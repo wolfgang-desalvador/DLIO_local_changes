@@ -1,0 +1,52 @@
+# DLRM Storage Benchmark Configuration
+#
+# This configuration benchmarks storage system performance for DLRM-like
+# workloads using Parquet files. The parquet_storage format reads raw bytes
+# without CPU decode overhead, providing accurate storage throughput measurement.
+#
+# See docs/PARQUET_OPTIMIZATION_ANALYSIS.md for methodology details.
+
+model: dlrm
+
+framework: pytorch
+
+workflow:
+  generate_data: True
+  train: True
+  checkpoint: False
+
+dataset:
+  # Use parquet_storage for pure storage benchmarking
+  # Use parquet for ML training simulation (includes decode)
+  format: parquet_storage
+  data_folder: ./data/dlrm_storage
+  num_files_train: 24
+  num_samples_per_file: 4718592
+  # DLRM embedding record: 18944 bytes per sample
+  record_length: 18944
+  record_length_stdev: 0
+
+parquet:
+  # Memory-mapped access for efficient I/O
+  memory_map: true
+  # Set to true to bypass page cache (cold-cache testing)
+  use_odirect: false
+  # Number of row groups to cache
+  row_group_cache_size: 4
+  # Row group size for data generation
+  row_group_size: 64
+
+reader:
+  data_loader: pytorch
+  read_type: on_demand
+  batch_size: 2048
+  transfer_size: 262144
+
+train:
+  epochs: 1
+  computation_time: 0.0
+
+# Dataset size calculation:
+# 24 files x 4,718,592 samples x 18,944 bytes = ~2.0 TB uncompressed
+# For NVMe testing (~512GB), use:
+#   num_files_train: 6 (for ~500GB dataset)

@@ -1,0 +1,105 @@
+# DLRM B200 Workload - Arrow IPC
+# Scaled to fit in 512GB NVMe storage
+#
+# Original: 1024 files, 4718592 samples/file, ~3.68 TB total
+# Scaled:   24 files, 4718592 samples/file, ~86 GB total
+
+model:
+  name: dlrm_arrow_ipc
+
+framework: pytorch
+
+workflow:
+  generate_data: True
+  train: True
+  checkpoint: False
+
+dataset:
+  data_folder: /home/developer/workspace/nvme/dlrm_arrow_ipc/
+  format: arrow_ipc
+  num_files_train: 24
+  num_samples_per_file: 4718592
+  record_length: 761
+  record_length_stdev: 0
+  compression: none
+
+  parquet:
+    memory_map: true
+    metadata_cache: true
+    row_group_cache_size: 8
+
+    columns:
+      - name: feature_000
+        dtype: float16
+        read: false
+      - name: feature_001
+        dtype: float16
+        read: false
+      - name: feature_002
+        dtype: float64
+        read: false
+      - name: feature_003
+        dtype: float64
+        read: false
+      - name: feature_004
+        dtype: float32
+        read: false
+      - name: feature_005
+        dtype: float16
+        read: false
+      - name: feature_006
+        dtype: float32
+        read: false
+      - name: feature_007
+        dtype: int8
+        read: false
+      - name: feature_008
+        dtype: float16
+        read: false
+      - name: feature_009
+        dtype: int8
+        read: false
+      - name: feature_010
+        dtype: float32
+        read: false
+      - name: feature_011
+        dtype: float32
+        read: true
+      - name: feature_012
+        dtype: float64
+        read: false
+      - name: feature_013
+        dtype: float32
+        read: false
+      - name: feature_014
+        dtype: int8
+        read: false
+      - name: feature_015
+        dtype: float16
+        read: false
+      - name: feature_016
+        dtype: float32
+        read: false
+      - name: feature_017
+        dtype: float32
+        read: true
+      - name: feature_018
+        dtype: float32
+        read: true
+      - name: feature_019
+        dtype: float16
+        read: false
+
+reader:
+  data_loader: pytorch
+  batch_size: 12288
+  prefetch_size: 2
+  read_threads: 4
+  file_shuffle: seed
+
+train:
+  epochs: 1
+  computation_time: 0.000375
+
+metric:
+  au: 0.70

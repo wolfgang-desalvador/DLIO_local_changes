@@ -1,0 +1,52 @@
+# Flux Storage Benchmark Configuration
+#
+# This configuration benchmarks storage system performance for Flux-like
+# (image generation) workloads using Parquet files. The parquet_storage
+# format reads raw bytes without CPU decode overhead, providing accurate
+# storage throughput measurement.
+#
+# See docs/PARQUET_OPTIMIZATION_ANALYSIS.md for methodology details.
+
+model: flux
+
+framework: pytorch
+
+workflow:
+  generate_data: True
+  train: True
+  checkpoint: False
+
+dataset:
+  # Use parquet_storage for pure storage benchmarking
+  # Use parquet for ML training simulation (includes decode)
+  format: parquet_storage
+  data_folder: ./data/flux_storage
+  num_files_train: 150
+  num_samples_per_file: 288
+  # Flux image record: ~2.2MB per sample (2228224 bytes)
+  record_length: 2228224
+  record_length_stdev: 0
+
+parquet:
+  # Memory-mapped access for efficient I/O
+  memory_map: true
+  # Set to true to bypass page cache (cold-cache testing)
+  use_odirect: false
+  # Number of row groups to cache
+  row_group_cache_size: 4
+  # Row group size for data generation
+  row_group_size: 32
+
+reader:
+  data_loader: pytorch
+  read_type: on_demand
+  batch_size: 4
+  transfer_size: 8912896
+
+train:
+  epochs: 1
+  computation_time: 0.0
+
+# Dataset size calculation:
+# 150 files x 288 samples x 2,228,224 bytes = ~90 GB
+# This fits comfortably on a 512GB NVMe drive
