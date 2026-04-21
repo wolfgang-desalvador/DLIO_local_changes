@@ -52,7 +52,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 from dlio_benchmark.checkpointing.checkpointing_factory import CheckpointingFactory
 from dlio_benchmark.common.constants import MODULE_DLIO_BENCHMARK
-from dlio_benchmark.common.enumerations import DatasetType, MetadataType
+from dlio_benchmark.common.enumerations import DatasetType, MetadataType, FormatType
 from dlio_benchmark.utils.utility import utcnow, DLIOMPI, Profile, dft_ai, DLIOLogger
 from dlio_benchmark.utils.statscounter import StatsCounter
 from dlio_benchmark.utils.config import LoadConfig, ConfigArguments, GetConfig
@@ -66,6 +66,14 @@ dlp = Profile(MODULE_DLIO_BENCHMARK)
 dftracer_initialize = True
 dftracer_finalize   = True
 dftracer            = None
+
+
+# Map format types to their actual file extension on disk.
+# Most formats use their enum value directly; these are the exceptions.
+_FORMAT_TO_EXTENSION = {
+    FormatType.PARQUET_STORAGE: 'parquet',
+}
+
 
 class DLIOBenchmark(object):
     """
@@ -213,6 +221,7 @@ class DLIOBenchmark(object):
         file_list_eval = []
         num_subfolders = 0
         if self.args.do_train:
+            file_ext = _FORMAT_TO_EXTENSION.get(self.args.format, str(self.args.format))
             for dataset_type in [DatasetType.TRAIN, DatasetType.VALID]:
                 if dataset_type == DatasetType.TRAIN:
                     num_subfolders = self.num_subfolders_train
@@ -228,7 +237,7 @@ class DLIOBenchmark(object):
                         check_path) == MetadataType.DIRECTORY:
                     assert (num_subfolders == len(filenames))
                     fullpaths = self.storage.walk_node(
-                        os.path.join(self.args.data_folder, f"{dataset_type}/*/*.{self.args.format}"),
+                        os.path.join(self.args.data_folder, f"{dataset_type}/*/*.{file_ext}"),
                         use_pattern=True)
                     files = [self.storage.get_basename(f) for f in fullpaths]
                     idx = np.argsort(files)
@@ -237,7 +246,7 @@ class DLIOBenchmark(object):
                 else:
                     assert (num_subfolders == 0)
                     fullpaths = [self.storage.get_uri(os.path.join(self.args.data_folder, f"{dataset_type}", entry))
-                                for entry in filenames if entry.endswith(f'{self.args.format}')]
+                                for entry in filenames if entry.endswith(f'{file_ext}')]
                     fullpaths = sorted(fullpaths)
                     self.logger.debug(f"fullpaths {fullpaths}")
                 self.logger.debug(f"subfolder {num_subfolders} fullpaths {fullpaths}")
