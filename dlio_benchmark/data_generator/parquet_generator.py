@@ -74,8 +74,8 @@ class ParquetGenerator(DataGenerator):
        string, binary, bool.
 
     2. **Legacy mode** (``parquet_columns`` empty):
-       Single ``data`` column of fixed-size uint8 lists, matching the original
-       DLIO behaviour for backward compatibility.
+       Single ``data`` column using ``pa.large_binary()``, which avoids
+       the file-size bloat of ``FixedSizeListArray<uint8>``.
 
     Key design properties:
     - **Unique samples**: every row in every batch has distinct data — the
@@ -83,10 +83,8 @@ class ParquetGenerator(DataGenerator):
     - **RNG flow-through**: a single ``np.random.Generator`` is initialised
       once per rank and advanced naturally through all file and batch
       generations.  No seed resets occur between files.
-    - **Near-zero copy**: numeric columns use ``gen_random_tensor`` with
-      ``rng=rng``; once the raw bytes exist they are wrapped in a
-      ``FixedSizeListArray`` via ``pa.array()`` using contiguous buffers —
-      no Python-level list comprehensions for fixed-size data.
+    - **Efficient encoding**: uses ``large_binary()`` for blob/vector columns
+      and disables dictionary encoding and statistics for random data.
     - **Configurable batching**: large files are written in batches of
       ``parquet_generation_batch_size`` rows to bound peak memory.
     """
@@ -105,17 +103,16 @@ class ParquetGenerator(DataGenerator):
         """Build PyArrow schema from configured columns.
 
         When called in legacy mode (``parquet_columns`` is empty or None),
-        ``legacy_elem_size`` must be provided; it is the number of uint8
-        elements per sample (= dim1 * dim2).  The schema uses a
-        ``pa.list_(pa.uint8(), legacy_elem_size)`` fixed-size list, which
-        lets PyArrow use the efficient ``FixedSizeListArray`` representation
-        on reads.
+        creates a single ``data`` column with ``pa.large_binary()`` type.
+        ``legacy_elem_size`` is accepted for API compatibility but ignored
+        since ``large_binary`` does not encode a fixed element count.
 
         When called in column-schema mode, ``legacy_elem_size`` is ignored.
+        Scalar columns (size==1) use their native Arrow type; vector columns
+        (size>1) use ``pa.large_binary()`` to avoid FixedSizeListArray bloat.
         """
         if not self.parquet_columns:
-            size = legacy_elem_size or 1
-            return pa.schema([('data', pa.list_(pa.uint8(), size))])
+            return pa.schema([('data', pa.large_binary())])
 
         fields = []
         for col_spec in self.parquet_columns:
@@ -132,19 +129,17 @@ class ParquetGenerator(DataGenerator):
                 if size == 1:
                     fields.append(pa.field(name, pa_scalar))
                 else:
-                    # Fixed-size list of the scalar type
-                    fields.append(pa.field(name, pa.list_(pa_scalar, size)))
-            elif dtype == 'list':
-                fields.append(pa.field(name, pa.list_(pa.float32(), size)))
+                    # Vector column — use large_binary for efficiency
+                    fields.append(pa.field(name, pa.large_binary()))
+            elif dtype in ('list', 'binary'):
+                fields.append(pa.field(name, pa.large_binary()))
             elif dtype == 'string':
                 fields.append(pa.field(name, pa.string()))
-            elif dtype == 'binary':
-                fields.append(pa.field(name, pa.binary()))
             elif dtype == 'bool':
                 fields.append(pa.field(name, pa.bool_()))
             else:
-                # Unknown dtype — fall back to fixed-size float32 list
-                fields.append(pa.field(name, pa.list_(pa.float32(), size)))
+                # Unknown dtype — fall back to large_binary
+                fields.append(pa.field(name, pa.large_binary()))
 
         return pa.schema(fields)
 
@@ -173,18 +168,23 @@ class ParquetGenerator(DataGenerator):
             data = gen_random_tensor(shape=(batch_size,), dtype=np_type, rng=rng)
             return name, pa.array(data, type=pa_scalar)
 
-        # ── Numeric fixed-size list (size > 1) ─────────────────────────────
+        # ── Numeric vector (size > 1) → large_binary ────────────────────────
         if np_type is not None and pa_scalar is not None:
-            # Generate as a flat (batch_size * size) array, then wrap as
-            # FixedSizeListArray — zero extra copies after dgen/numpy.
+            # Generate flat, then slice into per-sample binary blobs.
             data = gen_random_tensor(shape=(batch_size * size,), dtype=np_type, rng=rng)
-            arrow_flat = pa.array(data, type=pa_scalar)
-            return name, pa.FixedSizeListArray.from_arrays(arrow_flat, size)
+            bytes_per_sample = size * np.dtype(np_type).itemsize
+            raw = data.tobytes()
+            binary_data = [raw[j * bytes_per_sample:(j + 1) * bytes_per_sample]
+                           for j in range(batch_size)]
+            return name, pa.array(binary_data, type=pa.large_binary())
 
         if dtype == 'list':
             data = gen_random_tensor(shape=(batch_size * size,), dtype=np.float32, rng=rng)
-            arrow_flat = pa.array(data, type=pa.float32())
-            return name, pa.FixedSizeListArray.from_arrays(arrow_flat, size)
+            bytes_per_sample = size * 4  # float32
+            raw = data.tobytes()
+            binary_data = [raw[j * bytes_per_sample:(j + 1) * bytes_per_sample]
+                           for j in range(batch_size)]
+            return name, pa.array(binary_data, type=pa.large_binary())
 
         # ── Non-numeric types — use numpy global state (seeded per rank) ───
         if dtype == 'string':
@@ -195,16 +195,19 @@ class ParquetGenerator(DataGenerator):
         if dtype == 'binary':
             # Each sample: size random bytes from rng
             rows = [rng.bytes(size) for _ in range(batch_size)]
-            return name, pa.array(rows, type=pa.binary())
+            return name, pa.array(rows, type=pa.large_binary())
 
         if dtype == 'bool':
             bits = rng.integers(0, 2, size=batch_size, dtype=np.uint8)
             return name, pa.array(bits.astype(bool), type=pa.bool_())
 
-        # Fallback: float32 fixed-size list
+        # Fallback: large_binary blob
         data = gen_random_tensor(shape=(batch_size * size,), dtype=np.float32, rng=rng)
-        arrow_flat = pa.array(data, type=pa.float32())
-        return name, pa.FixedSizeListArray.from_arrays(arrow_flat, size)
+        bytes_per_sample = size * 4  # float32
+        raw = data.tobytes()
+        binary_data = [raw[j * bytes_per_sample:(j + 1) * bytes_per_sample]
+                       for j in range(batch_size)]
+        return name, pa.array(binary_data, type=pa.large_binary())
 
     def _generate_batch_columns(self, batch_size, rng):
         """Generate all configured columns for one batch.
@@ -222,17 +225,17 @@ class ParquetGenerator(DataGenerator):
         """Generate one batch for the legacy single-'data'-column mode.
 
         Generates ``(batch_size * elem_size)`` bytes in one dgen/numpy call,
-        then wraps the result as a ``FixedSizeListArray`` — no per-row Python
-        loop, no tiling, no copy.  Each row is a distinct slice of the data
-        stream so samples within the same file are NOT identical.
+        then slices into per-sample binary blobs for ``large_binary()``
+        encoding.  Each row is a distinct slice of the data stream so
+        samples within the same file are NOT identical.
 
         ``elem_size`` = dim1 * dim2 (the flat element count per sample).
         """
-        # One contiguous buffer for all rows — zero-copy FixedSizeList wrap.
         flat = gen_random_tensor(shape=(batch_size * elem_size,), dtype=np.uint8, rng=rng)
-        arrow_flat = pa.array(flat, type=pa.uint8())
-        arrow_data = pa.FixedSizeListArray.from_arrays(arrow_flat, elem_size)
-        return {'data': arrow_data}
+        raw = flat.tobytes()
+        binary_data = [raw[j * elem_size:(j + 1) * elem_size]
+                       for j in range(batch_size)]
+        return {'data': pa.array(binary_data, type=pa.large_binary())}
 
     # ── Main generation loop ──────────────────────────────────────────────────
 
@@ -302,7 +305,8 @@ class ParquetGenerator(DataGenerator):
             else:
                 writer_target = pa.BufferOutputStream()
 
-            with pq.ParquetWriter(writer_target, schema, compression=compression) as writer:
+            with pq.ParquetWriter(writer_target, schema, compression=compression,
+                                  use_dictionary=False, write_statistics=False) as writer:
                 # Generate all column data for the entire file upfront, then
                 # slice into row-groups for writing.  This reduces generation
                 # call overhead from (num_batches × num_columns) to num_columns,
