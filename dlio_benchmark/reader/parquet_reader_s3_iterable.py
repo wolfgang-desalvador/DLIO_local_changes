@@ -311,6 +311,10 @@ class ParquetReaderS3Iterable(FormatReader):
         root = self._args.storage_root.rstrip("/")
         return f"s3://{root}/{obj_key.lstrip('/')}"
 
+    def _uri_for_filename(self, filename: str) -> str:
+        """Alias for _uri_for_obj_key for backward compatibility."""
+        return self._uri_for_obj_key(filename)
+
     def _get_minio_client(self):
         if self._minio_client is None:
             from minio import Minio

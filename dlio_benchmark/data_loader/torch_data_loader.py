@@ -48,7 +48,6 @@ class TorchDataset(Dataset):
         args = ConfigArguments.get_instance()
         self.serial_args = pickle.dumps(args)
         self.logger = args.logger
-        self.dlp_logger = None
         if num_workers == 0:
             self.worker_init(-1)
 
@@ -57,16 +56,11 @@ class TorchDataset(Dataset):
         pickle.loads(self.serial_args)
         _args = ConfigArguments.get_instance()
         _args.configure_dlio_logging(is_child=True)
-        self.dlp_logger = _args.configure_dftracer(is_child=True, use_pid=True)
         self.logger.debug(f"{utcnow()} worker initialized {worker_id} with format {self.format_type}")
         self.reader = ReaderFactory.get_reader(type=self.format_type,
                                                dataset_type=self.dataset_type,
                                                thread_index=worker_id,
                                                epoch_number=self.epoch_number)
-
-    def __del__(self):
-        if self.dlp_logger:
-            self.dlp_logger.finalize()
 
     @dlp.log
     def __len__(self):
@@ -134,6 +128,7 @@ class TorchDataLoader(BaseDataLoader):
                     'prefetch_factor': prefetch_factor}
             if torch.__version__ != '1.3.1':       
                 kwargs['persistent_workers'] = True
+        pin_memory = self._args.pin_memory and torch.cuda.is_available()
         if torch.__version__ == '1.3.1':
             if 'prefetch_factor' in kwargs:
                 del kwargs['prefetch_factor']
@@ -141,7 +136,7 @@ class TorchDataLoader(BaseDataLoader):
                                        batch_size=self.batch_size,
                                        sampler=sampler,
                                        num_workers=self._args.read_threads,
-                                       pin_memory=self._args.pin_memory,
+                                       pin_memory=pin_memory,
                                        drop_last=True,
                                        worker_init_fn=dataset.worker_init, 
                                        **kwargs)
@@ -150,7 +145,7 @@ class TorchDataLoader(BaseDataLoader):
                                        batch_size=self.batch_size,
                                        sampler=sampler,
                                        num_workers=self._args.read_threads,
-                                       pin_memory=self._args.pin_memory,
+                                       pin_memory=pin_memory,
                                        drop_last=True,
                                        worker_init_fn=dataset.worker_init,
                                        **kwargs)  # 2 is the default value

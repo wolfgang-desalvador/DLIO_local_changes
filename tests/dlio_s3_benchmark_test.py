@@ -46,11 +46,17 @@ except ImportError as e:
     S3Checkpoint = None
 from urllib.parse import urlparse
 
-# Hard-disable object storage tests unless manually flipped in code.
-run_Object_Tests = False
-if not run_Object_Tests:
+# Object-storage tests require a live S3-compatible endpoint and are not run
+# in standard CI.  Enable by setting the environment variable:
+#
+#   DLIO_OBJECT_STORAGE_TESTS=1 pytest tests/dlio_s3_benchmark_test.py -v
+#
+# CI explicitly sets DLIO_OBJECT_STORAGE_TESTS=0, so these tests are always
+# skipped during automated builds.
+_OBJECT_TESTS_ENABLED = os.environ.get("DLIO_OBJECT_STORAGE_TESTS", "0") == "1"
+if not _OBJECT_TESTS_ENABLED:
     pytest.skip(
-        "Object-storage tests are disabled by default. Set run_Object_Tests=True to enable.",
+        "Object-storage tests are disabled. Set DLIO_OBJECT_STORAGE_TESTS=1 to enable.",
         allow_module_level=True,
     )
 
@@ -78,8 +84,19 @@ DLIO_TEST_OUTPUT_DIR = os.environ.get('DLIO_TEST_OUTPUT_DIR',
                         os.environ.get('DLIO_OUTPUT_FOLDER', 'dlio_test_output'))
 
 def finalize():
-    # DLIOMPI.get_instance().finalize()
-    pass
+    # Mirror dlio_benchmark_test.py: reset all framework/checkpointing singletons
+    # so that if these tests are ever enabled they don't leak state.
+    from dlio_benchmark.checkpointing.pytorch_checkpointing import PyTorchCheckpointing
+    from dlio_benchmark.checkpointing.tf_checkpointing import TFCheckpointing
+    from dlio_benchmark.checkpointing.pytorch_obj_store_checkpointing import PyTorchObjStoreCheckpointing
+    from dlio_benchmark.framework.torch_framework import TorchFramework
+    from dlio_benchmark.framework.tf_framework import TFFramework
+    PyTorchCheckpointing._PyTorchCheckpointing__instance = None
+    TFCheckpointing._TFCheckpointing__instance = None
+    PyTorchObjStoreCheckpointing._PyTorchObjStoreCheckpointing__instance = None
+    TorchFramework._TorchFramework__instance = None
+    TFFramework._TFFramework__instance = None
+    DLIOMPI.reset()
 
 def clean_s3(mock_client, bucket: str, prefixes: list[str]) -> None:
     comm.Barrier()

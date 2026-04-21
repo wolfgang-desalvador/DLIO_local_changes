@@ -1,0 +1,120 @@
+name: Fast CI
+
+# Run on every push / PR — completes in < 10 minutes per matrix leg.
+# Covers: preflight import checks, enumerations, utilities, config logic,
+# factories, data generators, reader compat, MPI smoke, and a small
+# end-to-end generate+train loop.
+#
+# Runs under THREE install methods:
+#   via-uv    : uv venv + uv pip install .[test]     (preferred going forward)
+#   via-setup : python -m venv + pip install .[test]  (traditional editable)
+#   via-reqs  : python -m venv + pip install -r requirements-test.txt
+#               + PYTHONPATH=$(pwd)
+#
+# For the full integration test suite see integration.yml (manual via workflow_dispatch).
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  fast-ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        install_method: ["via-uv", "via-setup", "via-reqs"]
+    name: fast-ci (${{ matrix.install_method }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      OMPI_ALLOW_RUN_AS_ROOT: "1"
+      OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: "1"
+      DLIO_OBJECT_STORAGE_TESTS: "0"
+      DLIO_MAX_AUTO_THREADS: "2"
+      DFTRACER_ENABLE: "1"
+      RDMAV_FORK_SAFE: "1"
+      VENV_PATH: "/home/runner/work/.venv/${{ matrix.install_method }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install MPI
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            openmpi-bin libopenmpi-dev
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install DLIO via uv  (via-uv)
+        if: matrix.install_method == 'via-uv'
+        run: |
+          uv venv "${VENV_PATH}"
+          source "${VENV_PATH}/bin/activate"
+          uv pip install ".[test]"
+
+      - name: Install DLIO via setup.py  (via-setup)
+        if: matrix.install_method == 'via-setup'
+        run: |
+          python -m venv "${VENV_PATH}"
+          source "${VENV_PATH}/bin/activate"
+          pip install --upgrade pip
+          pip install ".[test]"
+
+      - name: Install DLIO via requirements.txt  (via-reqs)
+        if: matrix.install_method == 'via-reqs'
+        run: |
+          python -m venv "${VENV_PATH}"
+          source "${VENV_PATH}/bin/activate"
+          pip install --upgrade pip
+          pip install -r requirements-test.txt
+          # dlio_benchmark is not installed as a package in this path —
+          # add the repo root to PYTHONPATH so imports resolve, same as
+          # the old ci.yml did.
+          echo "PYTHONPATH=$(pwd):${PYTHONPATH}" >> "${GITHUB_ENV}"
+
+      - name: Activate venv for remaining steps
+        run: echo "${VENV_PATH}/bin" >> "${GITHUB_PATH}"
+
+      - name: Run fast CI tests
+        # Exit code 134 = SIGABRT from TF+OpenMPI process teardown after all
+        # tests have already passed.  We tolerate it by inspecting the JUnit
+        # XML rather than trusting mpirun's exit code.
+        run: |
+          python -m pytest tests/test_fast_ci.py \
+            --tb=short -v \
+            --junitxml=fast-ci-results-${{ matrix.install_method }}.xml \
+            || code=$?; \
+               if [ "${code:-0}" -eq 134 ]; then \
+                 echo "Exit 134 (SIGABRT teardown) — checking results XML..."; \
+                 python -c "
+          import xml.etree.ElementTree as ET, sys
+          tree = ET.parse('fast-ci-results-${{ matrix.install_method }}.xml')
+          suite = tree.getroot().find('testsuite') or tree.getroot()
+          failures = int(suite.get('failures', 0)) + int(suite.get('errors', 0))
+          tests    = int(suite.get('tests', 0))
+          print(f'Tests: {tests}  Failures/Errors: {failures}')
+          sys.exit(1 if failures > 0 else 0)
+          "; \
+               elif [ "${code:-0}" -ne 0 ]; then \
+                 exit "${code:-0}"; \
+               fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-ci-results-${{ matrix.install_method }}
+          path: fast-ci-results-${{ matrix.install_method }}.xml
+

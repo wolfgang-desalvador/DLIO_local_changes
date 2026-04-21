@@ -14,28 +14,32 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 """
-import numpy as np
-
 from dlio_benchmark.common.constants import MODULE_DATA_READER
 from dlio_benchmark.reader.reader_handler import FormatReader
+from dlio_benchmark.reader._local_fs_iterable_mixin import _LocalFSIterableMixin
 from dlio_benchmark.utils.utility import Profile
 
 dlp = Profile(MODULE_DATA_READER)
 
 
-class NPZReader(FormatReader):
+class NPZReader(FormatReader, _LocalFSIterableMixin):
     """
-    Reader for NPZ files
+    Reader for NPZ files.
+
+    Uses _LocalFSIterableMixin to prefetch all assigned files in parallel
+    before the iteration loop. np.load decode is skipped because only the
+    raw byte count is needed for image_size telemetry.
     """
 
     @dlp.log_init
     def __init__(self, dataset_type, thread_index, epoch):
         super().__init__(dataset_type, thread_index)
+        self._localfs_init()
 
     @dlp.log
     def open(self, filename):
         super().open(filename)
-        return np.load(filename, allow_pickle=True)['x']
+        return self._local_cache.get(filename, 0)
 
     @dlp.log
     def close(self, filename):
@@ -44,22 +48,25 @@ class NPZReader(FormatReader):
     @dlp.log
     def get_sample(self, filename, sample_index):
         super().get_sample(filename, sample_index)
-        image = self.open_file_map[filename][..., sample_index]
-        dlp.update(image_size=image.nbytes)
+        byte_count = self.open_file_map.get(filename, 0)
+        dlp.update(image_size=byte_count)
 
     def next(self):
+        self._localfs_prefetch_all()
         for batch in super().next():
             yield batch
 
     @dlp.log
     def read_index(self, image_idx, step):
         dlp.update(step=step)
+        filename, _ = self.global_index_map[image_idx]
+        self._localfs_ensure_cached(filename)
         return super().read_index(image_idx, step)
 
     @dlp.log
     def finalize(self):
         return super().finalize()
-    
+
     def is_index_based(self):
         return True
 

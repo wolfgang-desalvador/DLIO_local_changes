@@ -14,29 +14,34 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 """
-import numpy as np
-from PIL import Image
-
 from dlio_benchmark.common.constants import MODULE_DATA_READER
 from dlio_benchmark.reader.reader_handler import FormatReader
+from dlio_benchmark.reader._local_fs_iterable_mixin import _LocalFSIterableMixin
 from dlio_benchmark.utils.utility import utcnow
 from dlio_benchmark.utils.utility import Profile, dft_ai
 
 dlp = Profile(MODULE_DATA_READER)
 
-class ImageReader(FormatReader):
+class ImageReader(FormatReader, _LocalFSIterableMixin):
     """
-    Reader for PNG / JPEG files
+    Reader for PNG / JPEG files.
+
+    Uses _LocalFSIterableMixin to prefetch all assigned files in parallel
+    before the iteration loop. Only the raw byte count is stored — PIL decode
+    is skipped entirely because FormatReader.next() returns resized_image
+    (a pre-built dummy tensor) and never uses decoded pixel data.
     """
 
     @dlp.log_init
     def __init__(self, dataset_type, thread_index, epoch):
         super().__init__(dataset_type, thread_index)
+        self._localfs_init()
 
     @dlp.log
     def open(self, filename):
-        super().open(filename)
-        return np.asarray(Image.open(filename))
+        # Prefetch already read the file; return cached byte count as the
+        # "file handle" so get_sample can look it up from open_file_map.
+        return self._local_cache.get(filename, 0)
 
     @dlp.log
     def close(self, filename):
@@ -46,16 +51,19 @@ class ImageReader(FormatReader):
     def get_sample(self, filename, sample_index):
         self.logger.debug(f"{utcnow()} sample_index {sample_index}, {self.image_idx}")
         super().get_sample(filename, sample_index)
-        image = self.open_file_map[filename]
-        dlp.update(image_size=image.nbytes)
-        dft_ai.update(image_size=image.nbytes)
+        byte_count = self.open_file_map.get(filename, 0)
+        dlp.update(image_size=byte_count)
+        dft_ai.update(image_size=byte_count)
 
     def next(self):
+        self._localfs_prefetch_all()
         for batch in super().next():
             yield batch
 
     @dlp.log
     def read_index(self, image_idx, step):
+        filename, _ = self.global_index_map[image_idx]
+        self._localfs_ensure_cached(filename)
         return super().read_index(image_idx, step)
 
     @dlp.log

@@ -2,9 +2,61 @@
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "dlio_benchmark"
+version = "3.0.0"
+description = "An I/O benchmark for deep learning applications"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "dgen-py>=0.2.2",
+    "h5py>=3.11.0",
+    "mpi4py>=3.1.4",
+    "numpy>=1.23.5",
+    "omegaconf>=2.2.0",
+    "pandas>=1.5.1",
+    "Pillow>=9.3.0",
+    "psutil>=5.9.8",
+    "PyYAML>=6.0.0",
+    "hydra-core>=1.3.2",
+    "typing-extensions>=4.15.0",
+    "torch>=2.8.0",
+    "tensorflow>=2.20.0",
+    "pyarrow>=21.0.0",
+    "pydftracer>=2.0.2",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-timeout",
+    "pytest-xdist",
+    "dftracer>=2.0.1",
+]
+dftracer = [
+    "pydftracer>=2.0.2",
+]
+s3 = ["s3torchconnector"]
+aistore = ["aistore"]
+parquet = ["pyarrow>=12.0.0"]
+dali = ["nvidia-dali-cuda120>=1.34.0"]
+torch = ["torch>=2.2.0", "torchaudio", "torchvision"]
+tensorflow = ["tensorflow>=2.13.1"]
+
+[project.scripts]
+dlio_benchmark = "dlio_benchmark.main:main"
+dlio_benchmark_query = "dlio_benchmark.main:query_config"
+dlio_postprocessor = "dlio_benchmark.postprocessor:main"
+
 [tool.pytest.ini_options]
 timeout = 3000
 log_cli = true
 log_cli_level = "INFO"
 log_cli_format = "%(asctime)s [%(levelname)8s] %(message)s (%(filename)s:%(lineno)s)"
 log_cli_date_format = "%Y-%m-%d %H:%M:%S"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-timeout>=2.4.0",
+]

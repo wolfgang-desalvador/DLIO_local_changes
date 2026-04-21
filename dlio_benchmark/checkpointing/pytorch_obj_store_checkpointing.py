@@ -159,7 +159,7 @@ class PyTorchObjStoreCheckpointing(PyTorchCheckpointing):
 
         # Build StreamingCheckpointing once; reused for all save/load calls.
         try:
-            from mlpstorage.checkpointing import StreamingCheckpointing as _SC
+            from mlpstorage_py.checkpointing import StreamingCheckpointing as _SC
         except ImportError as exc:
             raise ImportError(
                 "Object-store checkpointing requires mlpstorage. "

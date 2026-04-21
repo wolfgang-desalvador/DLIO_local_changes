@@ -87,11 +87,18 @@ logging.basicConfig(
 for _noisy in ("urllib3", "botocore", "s3transfer", "filelock", "hydra"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
-# ─── Hard-disable live object storage tests unless manually flipped in code ───
-run_Object_Tests = False
-if not run_Object_Tests:
+# ─── Object-storage opt-in gate ──────────────────────────────────────────────
+# These tests hit a live MinIO/S3 endpoint and are NOT run by default.
+# Enable by setting the environment variable before running pytest:
+#
+#   DLIO_OBJECT_STORAGE_TESTS=1 pytest tests/test_s3dlio_object_store.py -v
+#
+# CI explicitly sets DLIO_OBJECT_STORAGE_TESTS=0, so these tests are always
+# skipped during automated builds.
+_OBJECT_TESTS_ENABLED = os.environ.get("DLIO_OBJECT_STORAGE_TESTS", "0") == "1"
+if not _OBJECT_TESTS_ENABLED:
     pytest.skip(
-        "Object-storage tests are disabled by default. Set run_Object_Tests=True to enable.",
+        "Object-storage tests are disabled. Set DLIO_OBJECT_STORAGE_TESTS=1 to enable.",
         allow_module_level=True,
     )
 

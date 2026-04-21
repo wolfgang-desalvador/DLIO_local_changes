@@ -86,9 +86,9 @@ class FormatReader(ABC):
             batch.append(self._args.resized_image)
             image_processed += 1
             is_last = 0 if image_processed < total_images else 1
-            if is_last:
-                while len(batch) is not self.batch_size:
-                    batch.append(self._args.resized_image)
+            # Drop incomplete last batch (drop_last=True semantics, matching PyTorch DataLoader).
+            # A partial batch at the end would have the wrong shape for TF's from_generator,
+            # and the test expectations use floor division (num_data // batch_size).
             dft_ai.data.item.stop()
             if len(batch) == self.batch_size:
                 self.step += 1

@@ -203,8 +203,9 @@ class _S3IterableMixin:
         )
         if secure:
             import certifi
+            ca_bundle = os.environ.get("AWS_CA_BUNDLE") or certifi.where()
             pool = urllib3.PoolManager(
-                cert_reqs="CERT_REQUIRED", ca_certs=certifi.where(), **pool_kwargs
+                cert_reqs="CERT_REQUIRED", ca_certs=ca_bundle, **pool_kwargs
             )
         else:
             pool = urllib3.PoolManager(cert_reqs="CERT_NONE", **pool_kwargs)

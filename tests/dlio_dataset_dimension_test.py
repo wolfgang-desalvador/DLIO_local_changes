@@ -68,8 +68,15 @@ def generate_dlio_param(framework, storage_root, fmt, num_data, num_epochs=2):
     ]
 
 def generate_random_shape(dim):
-    """Generate a random shape with the given dimensions (deterministic per test run)."""
-    shape = [np.random.randint(1, 10) for _ in range(dim)]
+    """Generate a deterministic shape for the given number of dimensions.
+
+    Uses a fixed seed derived from ``dim`` so that parametrized tests always
+    produce the same shape regardless of execution order.  Using the global
+    numpy RNG here would make the value dependent on how many calls came
+    before, making tests fragile and non-reproducible.
+    """
+    rng = np.random.default_rng(seed=dim * 31337)
+    shape = [int(x) for x in rng.integers(1, 10, size=dim)]
     return shape
 
 @pytest.fixture

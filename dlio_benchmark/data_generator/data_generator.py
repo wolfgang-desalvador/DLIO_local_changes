@@ -17,6 +17,7 @@
 
 from abc import ABC, abstractmethod
 import io
+from concurrent.futures import ThreadPoolExecutor
 
 from dlio_benchmark.utils.config import ConfigArguments
 from dlio_benchmark.storage.storage_factory import StorageFactory
@@ -36,6 +37,9 @@ class DataGenerator(ABC):
 
     def __init__(self):
         self._args = ConfigArguments.get_instance()
+        # Issue 6b note: derive_configurations() here runs the early (no file list) path.
+        # validate() is NOT called here — it is called in main.py after the file list walk.
+        # This is intentional: validate() checks file counts which aren't known until walk.
         self._args.derive_configurations()
         self._dimension = self._args.dimension
         self._dimension_stdev = self._args.dimension_stdev
@@ -99,6 +103,7 @@ class DataGenerator(ABC):
         - Dimension extraction (scalar / list branch).
         - BytesIO abstraction for object storage.
         - ``storage.put_data()`` after each file when not on local FS.
+        - Parallel file writes via ``ThreadPoolExecutor`` when ``write_threads > 1``.
 
         **write_fn signature**::
 
@@ -110,14 +115,13 @@ class DataGenerator(ABC):
         - ``i``            : global file index (unique per file across all ranks)
         - ``dim_``         : raw dimension from ``get_dimension()`` (list or int)
         - ``dim1, dim2``   : extracted scalar first/second dimensions
-        - ``file_seed``    : reproducible per-file seed derived from ``rng`` via
-                             ``rng.integers(0, 2**63)``. Not the arithmetic
-                             ``BASE_SEED + i`` — seeds are well-spread across
-                             the full int64 space, eliminating adjacent-seed
-                             correlations. The sequence is deterministic.
-        - ``rng``          : ``np.random.Generator`` seeded with
-                             ``BASE_SEED + my_rank`` (for any additional
-                             per-rank stochastic ops inside write_fn)
+        - ``file_seed``    : reproducible per-file seed (int64).  Each worker
+                             creates its own ``np.random.default_rng(file_seed)``
+                             so that: (a) no shared mutable state crosses thread
+                             boundaries, and (b) the same config always generates
+                             identical files regardless of ``write_threads``.
+        - ``rng``          : ``np.random.Generator`` seeded from ``file_seed`` —
+                             a fresh instance per file, safe for concurrent use.
         - ``out_path_spec``: fully-resolved path string
         - ``is_local``     : ``True`` for local filesystem, ``False`` for object store
         - ``output``       : ``out_path_spec`` when ``is_local``,
@@ -126,33 +130,55 @@ class DataGenerator(ABC):
         After ``write_fn`` returns, if ``not is_local``, the template calls::
 
             storage.put_data(out_path_spec, output.getvalue())
+
+        **Parallel semantics** (Issue 10):
+
+        Seeds are pre-derived sequentially in the main thread so that
+        determinism is preserved: ``same master seed → same per-file seeds →
+        identical files`` regardless of ``write_threads`` value.
+        Worker threads each receive a pre-computed seed and create their own
+        independent ``np.random.Generator`` — no shared RNG state.
         """
         # Rank-unique seed for get_dimension() global random state.
-        # Each rank gets the same base seed offset by its rank number, ensuring
-        # dimensions are reproducible per-rank but different across ranks.
         np.random.seed(self.BASE_SEED + self.my_rank)
         rng = np.random.default_rng(seed=self.BASE_SEED + self.my_rank)
         dim = self.get_dimension(self.total_files_to_generate)
         is_local = self.storage.islocalfs()
 
+        # Phase 1: Pre-derive all (index, dims, seed, path) in the main thread.
+        # rng.integers() calls MUST happen in order to preserve the deterministic
+        # sequence; workers receive pre-computed seeds and never touch this rng.
+        jobs = []
         for i in dlp_base.iter(range(self.my_rank,
                                      int(self.total_files_to_generate),
                                      self.comm_size)):
             dim_, dim1, dim2 = self._extract_dims(dim, i)
             out_path_spec = self.storage.get_uri(self._file_list[i])
+            file_seed = int(rng.integers(0, 2**63))
+            jobs.append((i, dim_, dim1, dim2, file_seed, out_path_spec))
+
+        # Phase 2: Execute writes, optionally in parallel.
+        # Each worker creates a fresh rng from its pre-derived file_seed so
+        # there is no shared mutable state between threads.
+        def _write_one(job):
+            i, dim_, dim1, dim2, file_seed, out_path_spec = job
             progress(i + 1, self.total_files_to_generate, f"Generating {label}")
             output = out_path_spec if is_local else io.BytesIO()
-            # Derive file seed from the flowing RNG — not arithmetic (BASE_SEED + i).
-            # This produces well-spread, non-adjacent seeds without "resetting" the
-            # RNG between files. The sequence is deterministic: same master seed →
-            # same derived sequence → same files on every run.
-            file_seed = int(rng.integers(0, 2**63))
-
-            write_fn(i, dim_, dim1, dim2, file_seed, rng,
+            worker_rng = np.random.default_rng(seed=file_seed)
+            write_fn(i, dim_, dim1, dim2, file_seed, worker_rng,
                      out_path_spec, is_local, output)
-
             if not is_local:
                 self.storage.put_data(out_path_spec, output.getvalue())
+
+        write_threads = getattr(self._args, 'write_threads', 1)
+        n_workers = max(1, min(write_threads, len(jobs))) if jobs else 1
+
+        if n_workers == 1 or len(jobs) <= 1:
+            for job in jobs:
+                _write_one(job)
+        else:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                list(pool.map(_write_one, jobs))
 
         np.random.seed()  # Reset global seed to avoid leaking state
 

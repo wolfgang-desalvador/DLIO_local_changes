@@ -112,7 +112,7 @@ class PyTorchCheckpointing(BaseCheckpointing):
 
         if cache_key not in self._streaming_cache:
             try:
-                from mlpstorage.checkpointing import StreamingCheckpointing as _SC
+                from mlpstorage_py.checkpointing import StreamingCheckpointing as _SC
             except ImportError:
                 from dlio_benchmark.checkpointing.simple_streaming_checkpointing import (
                     SimpleStreamingCheckpointing as _SC,

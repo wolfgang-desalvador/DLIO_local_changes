@@ -19,6 +19,7 @@ import numpy as np
 import PIL.Image as im
 
 from dlio_benchmark.data_generator.data_generator import DataGenerator
+from dlio_benchmark.common.enumerations import DataLoaderType
 from dlio_benchmark.utils.utility import progress, utcnow, gen_random_tensor
 from dlio_benchmark.utils.utility import Profile
 from dlio_benchmark.common.constants import MODULE_DATA_GENERATOR
@@ -31,11 +32,20 @@ class PNGGenerator(DataGenerator):
         """
         Generator for creating data in PNG format of 3d dataset.
         Uses the base-class template for seeding, BytesIO, and put_data.
+
+        Fast path (non-DALI): writes raw random bytes — no PIL encode.
+        PIL encode costs ~100-200 ms/file for PNG and the bytes are never
+        decoded by any benchmark reader path. Skipping it gives a large
+        speedup for synthetic dataset generation.
+
+        DALI path: keeps the full PIL encode because fn.decoders.image()
+        requires a valid PNG bitstream.
         """
         super().generate()
         my_rank = self.my_rank
         total = self.total_files_to_generate
         logger = self.logger
+        use_fast_path = (self._args.data_loader != DataLoaderType.NATIVE_DALI)
 
         def _write(i, dim_, dim1, dim2, file_seed, rng,
                    out_path_spec, is_local, output):
@@ -44,9 +54,20 @@ class PNGGenerator(DataGenerator):
             records = np.clip(records, 0, 255).astype(np.uint8)
             if my_rank == 0:
                 logger.debug(f"{utcnow()} Dimension of images: {dim1} x {dim2}")
-            img = im.fromarray(records)
             if my_rank == 0 and i % 100 == 0:
                 logger.info(f"Generated file {i}/{total}")
-            img.save(output, format='PNG')
+            if use_fast_path:
+                # Write raw bytes — no PIL encode. Benchmark readers only
+                # measure byte count, never decode the content.
+                if is_local:
+                    with open(out_path_spec, 'wb') as f:
+                        f.write(records.tobytes())
+                else:
+                    output.write(records.tobytes())
+            else:
+                # Full PIL encode for native_dali: fn.decoders.image() needs
+                # a valid PNG bitstream.
+                img = im.fromarray(records)
+                img.save(output, format='PNG')
 
         self._generate_files(_write, "PNG Data")

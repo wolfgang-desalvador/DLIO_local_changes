@@ -16,13 +16,32 @@
 """
 import os
 import math
-from time import time
+import time
 import numpy as np
 
 # Reduce TF and CUDA logging
 
 import hydra
 from omegaconf import DictConfig
+from dlio_benchmark.common.enumerations import StorageType as _StorageType
+
+
+def _apply_settle_guard(args, comm) -> None:
+    """Sleep after data generation for eventual-consistency object stores.
+
+    Only activates when *both* conditions are true:
+      - ``args.storage_type`` is not ``LOCAL_FS`` (i.e. an object store)
+      - ``args.post_generation_settle_seconds > 0``
+
+    Rank-0 sleeps for the configured duration; then all ranks barrier so
+    they proceed together.  Default is 0.0 — zero behaviour change for
+    existing configs.
+    """
+    if (args.post_generation_settle_seconds > 0
+            and args.storage_type != _StorageType.LOCAL_FS):
+        if args.my_rank == 0:
+            time.sleep(args.post_generation_settle_seconds)
+        comm.barrier()
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['AUTOGRAPH_VERBOSITY'] = '0'
@@ -43,11 +62,10 @@ from dlio_benchmark.data_generator.generator_factory import GeneratorFactory
 from dlio_benchmark.storage.storage_factory import StorageFactory
 
 dlp = Profile(MODULE_DLIO_BENCHMARK)
-# To make sure the output folder is the same in all the nodes. We have to do this.
 
 dftracer_initialize = True
 dftracer_finalize   = True
-dtracer             = None
+dftracer            = None
 
 class DLIOBenchmark(object):
     """
@@ -66,23 +84,10 @@ class DLIOBenchmark(object):
         """
         global dftracer, dftracer_initialize, dftracer_finalize
 
-        t0 = time()
+        t0 = time.time()
         self.args = ConfigArguments.get_instance()
         LoadConfig(self.args, cfg)
 
-        print(f"[DEBUG DLIOBenchmark.__init__] After LoadConfig:")
-        print(f"  storage_type   = {self.args.storage_type!r}")
-        print(f"  storage_root   = {self.args.storage_root!r}")
-        print(f"  storage_options= {self.args.storage_options!r}")
-        print(f"  data_folder    = {self.args.data_folder!r}")
-        print(f"  framework      = {self.args.framework!r}")
-        print(f"  num_files_train= {self.args.num_files_train!r}")
-        print(f"  record_length  = {self.args.record_length!r}")
-        print(f"  generate_data  = {self.args.generate_data!r}")
-        print(f"  do_train       = {self.args.do_train!r}")
-        print(f"  do_checkpoint  = {self.args.do_checkpoint!r}")
-        print(f"  epochs         = {self.args.epochs!r}")
-        print(f"  batch_size     = {self.args.batch_size!r}")
 
         self.storage = StorageFactory().get_storage(self.args.storage_type, self.args.storage_root,
                                                     self.args.framework)
@@ -107,8 +112,25 @@ class DLIOBenchmark(object):
         # Configure the logging library
         self.args.configure_dlio_logging(is_child=False)
         self.logger = DLIOLogger.get_instance()
+
         if dftracer_initialize:
             dftracer = self.args.configure_dftracer(is_child=False, use_pid=False)
+
+        if self.my_rank == 0:
+            self.logger.output(f"[DEBUG DLIOBenchmark.__init__] After LoadConfig:")
+            self.logger.output(f"  storage_type   = {self.args.storage_type!r}")
+            self.logger.output(f"  storage_root   = {self.args.storage_root!r}")
+            self.logger.output(f"  storage_options= {self.args.storage_options!r}")
+            self.logger.output(f"  data_folder    = {self.args.data_folder!r}")
+            self.logger.output(f"  framework      = {self.args.framework!r}")
+            self.logger.output(f"  num_files_train= {self.args.num_files_train!r}")
+            self.logger.output(f"  record_length  = {self.args.record_length!r}")
+            self.logger.output(f"  generate_data  = {self.args.generate_data!r}")
+            self.logger.output(f"  do_train       = {self.args.do_train!r}")
+            self.logger.output(f"  do_checkpoint  = {self.args.do_checkpoint!r}")
+            self.logger.output(f"  epochs         = {self.args.epochs!r}")
+            self.logger.output(f"  batch_size     = {self.args.batch_size!r}")
+        
         with Profile(name=f"{self.__init__.__qualname__}", cat=MODULE_DLIO_BENCHMARK):
             mode = []
             if self.args.generate_data:
@@ -178,6 +200,7 @@ class DLIOBenchmark(object):
             self.comm.barrier()
             if self.args.my_rank == 0:
                 self.logger.output(f"{utcnow()} Generation done")
+            _apply_settle_guard(self.args, self.comm)
 
         if not self.generate_only and self.do_profiling:
             self.profiler.start()
@@ -447,7 +470,6 @@ class DLIOBenchmark(object):
         """
         It finalizes the dataset once training is completed.
         """
-
         global dftracer, dftracer_initialize, dftracer_finalize
 
         self.comm.barrier()

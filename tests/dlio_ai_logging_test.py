@@ -55,6 +55,24 @@ from collections import Counter
 
 from tests.utils import delete_folder, run_mpi_benchmark, NUM_PROCS, TEST_TIMEOUT_SECONDS
 
+# These tests validate DFTracer AI event logging (.pfw trace files).
+# They require the dftracer native C extension AND DFTRACER_ENABLE=1 env var.
+# Skip the entire module when dftracer is not functional.
+try:
+    import dftracer.dftracer  # native C extension — ImportError if not built
+    _DFTRACER_NATIVE = True
+except ImportError:
+    _DFTRACER_NATIVE = False
+
+if not _DFTRACER_NATIVE:
+    pytest.skip(
+        "dftracer native C extension not installed. "
+        "Install with: pip install dlio_benchmark[dftracer] "
+        "(requires a full dftracer build with C extensions). "
+        "These tests validate AI event logging (.pfw trace files).",
+        allow_module_level=True,
+    )
+
 
 @pytest.fixture
 def setup_test_env():
@@ -148,7 +166,8 @@ def test_ai_logging_train(setup_test_env, framework, num_data, batch_size):
         "++workload.dataset.num_subfolders_train=0",
         "++workload.dataset.num_subfolders_eval=0",
         f"++workload.train.epochs={num_epochs}",
-        f"++workload.reader.batch_size={batch_size}"
+        f"++workload.reader.batch_size={batch_size}",
+        "++workload.reader.read_threads=1",
     ]
 
     # Run benchmark in MPI subprocess

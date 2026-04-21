@@ -303,6 +303,19 @@ class ParquetGenerator(DataGenerator):
                 writer_target = pa.BufferOutputStream()
 
             with pq.ParquetWriter(writer_target, schema, compression=compression) as writer:
+                # Generate all column data for the entire file upfront, then
+                # slice into row-groups for writing.  This reduces generation
+                # call overhead from (num_batches × num_columns) to num_columns,
+                # and full_table.slice() is zero-copy in Arrow.
+                # Trade-off: peak RAM holds one full file's worth of columns
+                # (typically a few hundred MiB for benchmark workloads).
+                if self.parquet_columns:
+                    full_columns = self._generate_batch_columns(self.num_samples, rng)
+                else:
+                    full_columns = self._generate_legacy_batch(elem_size, self.num_samples, rng)
+
+                full_table = pa.table(full_columns)
+
                 num_batches = (
                     self.num_samples + self.generation_batch_size - 1
                 ) // self.generation_batch_size
@@ -312,13 +325,8 @@ class ParquetGenerator(DataGenerator):
                     batch_end = min(batch_start + self.generation_batch_size, self.num_samples)
                     current_batch_size = batch_end - batch_start
 
-                    # rng advances per batch — each batch gets unique data.
-                    if self.parquet_columns:
-                        columns = self._generate_batch_columns(current_batch_size, rng)
-                    else:
-                        columns = self._generate_legacy_batch(elem_size, current_batch_size, rng)
-
-                    batch_table = pa.table(columns)
+                    # Zero-copy slice of the pre-generated table.
+                    batch_table = full_table.slice(batch_start, current_batch_size)
                     writer.write_table(batch_table, row_group_size=self.row_group_size)
 
             if not is_local:

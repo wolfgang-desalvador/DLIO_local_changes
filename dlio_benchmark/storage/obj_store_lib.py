@@ -43,6 +43,8 @@ class MinIOAdapter:
     
     def __init__(self, endpoint, access_key, secret_key, region=None, secure=True):
         from minio import Minio
+        import urllib3
+        import ssl
         # Parse endpoint to extract host and determine secure
         if endpoint:
             parsed = urlparse(endpoint if '://' in endpoint else f'http://{endpoint}')
@@ -50,13 +52,27 @@ class MinIOAdapter:
             secure = parsed.scheme == 'https' if parsed.scheme else secure
         else:
             host = "localhost:9000"
-            
+
+        # When TLS is in use, honour AWS_CA_BUNDLE for self-signed certificates.
+        http_client = None
+        if secure:
+            ca_bundle = os.environ.get("AWS_CA_BUNDLE")
+            if ca_bundle:
+                ctx = ssl.create_default_context(cafile=ca_bundle)
+                # maxsize must be set explicitly — urllib3 2.x defaults it to 1
+                # per pool. Minio uses num_parallel_uploads=3 threads for
+                # multipart uploads; without maxsize>=3 all but one connection
+                # is discarded on return, flooding logs with
+                # "Connection pool is full, discarding connection".
+                http_client = urllib3.PoolManager(ssl_context=ctx, maxsize=10)
+
         self.client = Minio(
             host,
             access_key=access_key,
             secret_key=secret_key,
             secure=secure,
-            region=region
+            region=region,
+            http_client=http_client,
         )
         
     def get_object(self, bucket_name, object_name, start=None, end=None):
@@ -246,7 +262,8 @@ class ObjStoreLibStorage(S3Storage):
                 )
             force_path_style_opt = self._args.s3_force_path_style
             if "s3_force_path_style" in storage_options:
-                force_path_style_opt = storage_options["s3_force_path_style"].strip().lower() == "true"
+                val = storage_options["s3_force_path_style"]
+                force_path_style_opt = val if isinstance(val, bool) else str(val).strip().lower() == "true"
                 
             max_attempts_opt = self._args.s3_max_attempts
             if "s3_max_attempts" in storage_options:
@@ -255,9 +272,12 @@ class ObjStoreLibStorage(S3Storage):
                 except (TypeError, ValueError):
                     max_attempts_opt = self._args.s3_max_attempts
                     
+            profile_opt = storage_options.get("s3_profile", None)
+
             s3_client_config = S3ClientConfig(
                 force_path_style=force_path_style_opt,
                 max_attempts=max_attempts_opt,
+                profile=profile_opt,
             )
             
             self.s3_client = S3Client(

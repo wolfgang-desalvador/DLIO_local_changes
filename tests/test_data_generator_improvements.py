@@ -71,7 +71,17 @@ def init():
 
 
 def finalize():
-    pass
+    from dlio_benchmark.checkpointing.pytorch_checkpointing import PyTorchCheckpointing
+    from dlio_benchmark.checkpointing.tf_checkpointing import TFCheckpointing
+    from dlio_benchmark.checkpointing.pytorch_obj_store_checkpointing import PyTorchObjStoreCheckpointing
+    from dlio_benchmark.framework.torch_framework import TorchFramework
+    from dlio_benchmark.framework.tf_framework import TFFramework
+    PyTorchCheckpointing._PyTorchCheckpointing__instance = None
+    TFCheckpointing._TFCheckpointing__instance = None
+    PyTorchObjStoreCheckpointing._PyTorchObjStoreCheckpointing__instance = None
+    TorchFramework._TorchFramework__instance = None
+    TFFramework._TFFramework__instance = None
+    DLIOMPI.reset()
 
 
 def clean(storage_root="./"):
@@ -547,8 +557,6 @@ def test_npy_reader_compatibility():
 
         if comm.rank == 0:
             train, _ = _find_files(cfg, None, "npy")
-            ConfigArguments.reset()
-            OmegaConf.to_container(cfg["workload"], resolve=True)
             workload_dict = OmegaConf.to_container(cfg["workload"], resolve=True)
             workload_dict.setdefault("output", {})["folder"] = DLIO_TEST_OUTPUT_DIR
             ConfigArguments.reset()
@@ -557,9 +565,19 @@ def test_npy_reader_compatibility():
 
             reader = NPYReader(DatasetType.TRAIN, thread_index=0, epoch=1)
             for p in train[:2]:
-                arr = reader.open(str(p))
-                assert arr is not None, f"NPYReader.open() returned None for {p.name}"
-                assert arr.ndim >= 2, f"NPYReader returned {arr.ndim}D array"
+                # NPYReader uses _LocalFSIterableMixin: open() returns a cached
+                # byte count (int), not a decoded array. Decoding is skipped
+                # because only raw storage bandwidth matters for benchmarking.
+                # The cache is populated by _localfs_prefetch_all() inside next();
+                # calling open() directly (outside next()) returns the default 0.
+                result = reader.open(str(p))
+                assert isinstance(result, int), (
+                    f"NPYReader.open() should return int byte count, got "
+                    f"{type(result).__name__}"
+                )
+                # Verify the generated file is a valid numpy array via np.load.
+                arr = np.load(str(p))
+                assert arr.ndim >= 2, f"Generated NPY has unexpected shape {arr.shape}"
 
     clean()
     finalize()

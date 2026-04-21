@@ -36,6 +36,75 @@ import numpy as np
 from typing import Optional, Dict
 
 dlp = Profile(MODULE_CONFIG)
+
+
+class VirtualIndexMap:
+    """Memory-efficient sample index map that computes file mappings on demand.
+
+    Instead of materializing a Python dict with billions of entries (each ~200
+    bytes), this class stores only:
+      - A shuffled permutation array (numpy int64, ~8 bytes/sample)
+      - The file list reference (small)
+      - num_samples_per_file (scalar)
+
+    For the DLRM workload with 1.74 billion samples this reduces memory from
+    ~350 GB (materialized dict) to ~14 GB (permutation array only).
+
+    Provides dict-like __getitem__, __contains__, items() interface for
+    drop-in compatibility with the existing code paths in reader_handler.py
+    and indexed_binary_*_reader.py.
+    """
+
+    def __init__(self, file_list, num_samples_per_file, start_sample, end_sample,
+                 shuffle_seed=None, storage_type=None):
+        self._num_samples_per_file = num_samples_per_file
+        self._start = start_sample
+
+        # Build the permutation array — this is the only large allocation
+        self._sample_list = np.arange(start_sample, end_sample + 1)
+        if shuffle_seed is not None:
+            np.random.seed(shuffle_seed)
+            np.random.shuffle(self._sample_list)
+
+        # Pre-resolve absolute paths once (only num_files entries)
+        if storage_type == StorageType.LOCAL_FS:
+            self._abs_paths = [os.path.abspath(f) for f in file_list]
+        else:
+            self._abs_paths = list(file_list)
+
+    def _resolve(self, global_sample_index):
+        """Compute (filename, sample_index) from a global sample index."""
+        file_index = int(global_sample_index // self._num_samples_per_file)
+        sample_index = int(global_sample_index % self._num_samples_per_file)
+        return (self._abs_paths[file_index], sample_index)
+
+    def __getitem__(self, global_sample_index):
+        return self._resolve(global_sample_index)
+
+    def __contains__(self, key):
+        return self._start <= key < self._start + len(self._sample_list)
+
+    def __len__(self):
+        return len(self._sample_list)
+
+    def __iter__(self):
+        return iter(self._sample_list)
+
+    def items(self):
+        """Yield (global_sample_index, (filename, sample_index)) pairs.
+
+        Used by indexed_binary_reader and indexed_binary_mmap_reader to
+        pre-load index files. Computes mappings on-the-fly.
+        """
+        for idx in self._sample_list:
+            yield int(idx), self._resolve(int(idx))
+
+    def __repr__(self):
+        return (f"VirtualIndexMap(samples={len(self._sample_list)}, "
+                f"files={len(self._abs_paths)}, "
+                f"samples_per_file={self._num_samples_per_file})")
+
+
 @dataclass
 class ConfigArguments:
     __instance = None
@@ -56,6 +125,7 @@ class ConfigArguments:
     storage_root: str = "./"
     storage_type: StorageType = StorageType.LOCAL_FS
     storage_options: Optional[Dict[str, str]] = None
+    post_generation_settle_seconds: float = 0.0
     record_length: int = 64 * 1024
     record_length_stdev: int = 0
     record_length_resize: int = 0
@@ -87,6 +157,7 @@ class ConfigArguments:
     transfer_size: int = None
     read_threads: int = 1
     dont_use_mmap: bool = False
+    write_threads: int = 1
     computation_threads: int = 1
     computation_time: ClassVar[Dict[str, Any]] = {}
     preprocess_time: ClassVar[Dict[str, Any]] = {}
@@ -143,7 +214,7 @@ class ConfigArguments:
     checkpoint_mechanism_classname = None
     data_loader_sampler: DataLoaderSampler = None
     reader_classname: str = None
-    multiprocessing_context: str = "fork"
+    multiprocessing_context: str = "spawn"
     pin_memory: bool = True
     odirect: bool = False
 
@@ -230,9 +301,6 @@ class ConfigArguments:
 
     def configure_dlio_logging(self, is_child=False):
         global DLIOLogger
-        # with "multiprocessing_context=fork" the log file remains open in the child process
-        if is_child and self.multiprocessing_context == "fork":
-            return
         # Configure the logging library
         log_format_verbose = '[%(levelname)s] %(message)s [%(pathname)s:%(lineno)d]'
         log_format_simple = '[%(levelname)s] %(message)s'
@@ -504,27 +572,32 @@ class ConfigArguments:
         if self.generate_data or self.do_checkpoint:
             from dlio_benchmark.utils.utility import HAS_DGEN
             method = self.data_gen_method.lower()
-            if method == 'numpy':
-                # Only reachable via explicit DLIO_DATA_GEN=numpy — warn loudly.
-                self.logger.output(f"{'='*80}")
-                self.logger.output(f"WARNING: Data Generation Method: NUMPY (Slow Legacy Path)")
-                self.logger.output(f"  Using NumPy random generation — 155x SLOWER than dgen-py")
-                self.logger.output(f"  This path is for explicit comparison benchmarks ONLY.")
-                self.logger.output(f"  Remove DLIO_DATA_GEN=numpy to restore dgen-py (default).")
-                self.logger.output(f"{'='*80}")
-            elif not HAS_DGEN:
-                # dgen is the default but dgen-py is not installed — warn and fall back.
-                self.logger.warning(
-                    "dgen-py is not installed — falling back to NumPy for data generation "
-                    "(~155x slower). Install dgen-py>=0.2.0 (requires Python>=3.11) for "
-                    "full performance, or set DLIO_DATA_GEN=numpy to suppress this warning."
-                )
+            
+            if method != 'numpy' and not HAS_DGEN:
                 self.data_gen_method = 'numpy'
-            else:
-                self.logger.output(f"{'='*80}")
-                self.logger.output(f"Data Generation Method: DGEN (default)")
-                self.logger.output(f"  dgen-py zero-copy BytesView — 155x faster than NumPy, 0 MiB overhead")
-                self.logger.output(f"{'='*80}")
+
+            if DLIOMPI.get_instance().rank() == 0:
+                if method == 'numpy':
+                    # Only reachable via explicit DLIO_DATA_GEN=numpy — warn loudly.
+                    self.logger.output(f"{'='*80}")
+                    self.logger.output(f"WARNING: Data Generation Method: NUMPY (Slow Legacy Path)")
+                    self.logger.output(f"  Using NumPy random generation — 155x SLOWER than dgen-py")
+                    self.logger.output(f"  This path is for explicit comparison benchmarks ONLY.")
+                    self.logger.output(f"  Remove DLIO_DATA_GEN=numpy to restore dgen-py (default).")
+                    self.logger.output(f"{'='*80}")
+                elif not HAS_DGEN:
+                    # dgen is the default but dgen-py is not installed — warn and fall back.
+                    self.logger.warning(
+                        "dgen-py is not installed — falling back to NumPy for data generation "
+                        "(~155x slower). Install dgen-py>=0.2.0 (requires Python>=3.11) for "
+                        "full performance, or set DLIO_DATA_GEN=numpy to suppress this warning."
+                    )
+                    
+                else:
+                    self.logger.output(f"{'='*80}")
+                    self.logger.output(f"Data Generation Method: DGEN (default)")
+                    self.logger.output(f"  dgen-py zero-copy BytesView — 155x faster than NumPy, 0 MiB overhead")
+                    self.logger.output(f"{'='*80}")
         
         if self.checkpoint_mechanism == CheckpointMechanismType.NONE:
             if self.framework == FrameworkType.TENSORFLOW:
@@ -631,6 +704,63 @@ class ConfigArguments:
             if self.format in [FormatType.JPEG, FormatType.PNG, FormatType.NPY, FormatType.TFRECORD]:
                 self.native_data_loader = True
 
+        # PR-4: Auto-derive multiprocessing_context for storage libraries that
+        # initialize async runtimes (Tokio, CUDA, gRPC) at import time.  When
+        # such a library is in use and the user has not explicitly overridden the
+        # default, switch to "spawn" so DataLoader workers start with a clean
+        # process rather than inheriting broken file-descriptors from the parent.
+        _spawn_required_libs = ("s3dlio", "s3torchconnector")
+        _storage_library_for_ctx = (self.storage_options or {}).get("storage_library")
+        if (_storage_library_for_ctx in _spawn_required_libs
+                and self.multiprocessing_context == "fork"):
+            self.logger.info(
+                f"Auto-setting multiprocessing_context='spawn' for "
+                f"storage_library='{_storage_library_for_ctx}'. "
+                "fork is unsafe with this library (async runtime destroyed in "
+                "forked child). Set reader.multiprocessing_context: spawn "
+                "explicitly in your YAML to suppress this message."
+            )
+            self.multiprocessing_context = "spawn"
+
+        # PR-5: Auto-size read_threads when the user has not set an explicit
+        # value (the dataclass default is 1).  Values > 1 in the YAML are
+        # treated as intentional and respected as-is.
+        # PR-13: Use ranks_per_node() instead of comm_size so that multi-node
+        # runs correctly size threads relative to the number of ranks on *this*
+        # node rather than across the entire job.
+        # DLIO_MAX_AUTO_THREADS caps both read and write auto-sizing.
+        # Useful in CI (set to 2) and tests (set in conftest.py) to prevent
+        # accidental saturation of small runner environments.
+        _env_cap = int(os.environ.get('DLIO_MAX_AUTO_THREADS', '8'))
+        _MAX_AUTO_READ_THREADS = max(1, _env_cap)
+        if self.read_threads == 1:
+            _cpu_count = os.cpu_count() or 1
+            _ranks_per_node = DLIOMPI.get_instance().ranks_per_node()
+            _per_rank_cpu = max(1, _cpu_count // max(1, _ranks_per_node))
+            _auto_threads = min(_per_rank_cpu, _MAX_AUTO_READ_THREADS)
+            if _auto_threads > 1:
+                self.logger.info(
+                    f"Auto-sizing read_threads to {_auto_threads} "
+                    f"(cpu_count={_cpu_count}, ranks_per_node={_ranks_per_node}). "
+                    "Set read_threads explicitly in your YAML to override."
+                )
+                self.read_threads = _auto_threads
+
+        # PR-14: Auto-size write_threads when the user has not set an explicit
+        # value (the dataclass default is 1).  Same formula as read_threads.
+        _MAX_AUTO_WRITE_THREADS = max(1, _env_cap)
+        if self.write_threads == 1:
+            _cpu_count = os.cpu_count() or 1
+            _ranks_per_node = DLIOMPI.get_instance().ranks_per_node()
+            _per_rank_cpu = max(1, _cpu_count // max(1, _ranks_per_node))
+            _auto_w_threads = min(_per_rank_cpu, _MAX_AUTO_WRITE_THREADS)
+            if _auto_w_threads > 1:
+                self.logger.info(
+                    f"Auto-sizing write_threads to {_auto_w_threads} "
+                    f"(cpu_count={_cpu_count}, ranks_per_node={_ranks_per_node}). "
+                    "Set write_threads explicitly in your YAML to override."
+                )
+                self.write_threads = _auto_w_threads
 
         # dimension-based derivations
 
@@ -693,42 +823,44 @@ class ConfigArguments:
                                                 abs_path,
                                                 sample_list[sample_index] % self.num_samples_per_file))
                     sample_index += 1
-                    file_index = (sample_index // self.num_samples_per_file) % num_files
+                    # Carry the rank offset forward so each rank stays in its own
+                    # file partition. Without the offset, non-zero ranks fall back
+                    # to rank-0's file range on the second and subsequent samples.
+                    file_index = (self.my_rank * files_per_rank + sample_index // self.num_samples_per_file) % num_files
         return process_thread_file_map, samples_sum
 
     @dlp.log
     def get_global_map_index(self, file_list, total_samples, epoch_number):
-        process_thread_file_map = {}
         num_files = len(file_list)
-        start_sample = 0
-        end_sample = 0
-        samples_sum = 0
-        if num_files > 0:
-            end_sample = total_samples - 1
-            samples_per_proc = int(math.ceil(total_samples/self.comm_size)) 
-            start_sample = self.my_rank * samples_per_proc
-            end_sample = (self.my_rank + 1) * samples_per_proc - 1
-            if end_sample > total_samples - 1:
-                end_sample = total_samples - 1
-            self.logger.debug(f"my_rank: {self.my_rank}, start_sample: {start_sample}, end_sample: {end_sample}")
-            sample_list = np.arange(start_sample, end_sample + 1)
-            if self.sample_shuffle is not Shuffle.OFF:
-                if self.seed_change_epoch:
-                    np.random.seed(self.seed + epoch_number)
-                else:
-                    np.random.seed(self.seed)
-                np.random.shuffle(sample_list)
-            for sample_index in range(end_sample - start_sample + 1):
-                global_sample_index = sample_list[sample_index]
-                samples_sum += global_sample_index
-                file_index = int(math.floor(global_sample_index/self.num_samples_per_file))
-                if self.storage_type == StorageType.LOCAL_FS:
-                    abs_path = os.path.abspath(file_list[file_index])
-                else:
-                    abs_path = file_list[file_index]
-                sample_index = global_sample_index % self.num_samples_per_file
-                process_thread_file_map[global_sample_index] = (abs_path, sample_index)
-        return process_thread_file_map, samples_sum
+        if num_files == 0:
+            return {}, 0
+
+        samples_per_proc = int(math.ceil(total_samples / self.comm_size))
+        start_sample = self.my_rank * samples_per_proc
+        end_sample = min((self.my_rank + 1) * samples_per_proc - 1, total_samples - 1)
+        self.logger.debug(f"my_rank: {self.my_rank}, start_sample: {start_sample}, end_sample: {end_sample}")
+
+        # Determine shuffle seed (None = no shuffle)
+        shuffle_seed = None
+        if self.sample_shuffle is not Shuffle.OFF:
+            shuffle_seed = (self.seed + epoch_number) if self.seed_change_epoch else self.seed
+
+        vmap = VirtualIndexMap(
+            file_list, self.num_samples_per_file,
+            start_sample, end_sample,
+            shuffle_seed=shuffle_seed,
+            storage_type=self.storage_type,
+        )
+
+        # Compute samples_sum using numpy to avoid Python loop over billions of elements
+        samples_sum = int(np.sum(vmap._sample_list, dtype=np.int64))
+
+        self.logger.info(
+            f"{utcnow()} VirtualIndexMap: {len(vmap)} samples, "
+            f"~{len(vmap) * 8 / 1e9:.1f} GB permutation array "
+            f"(saved ~{len(vmap) * 200 / 1e9:.0f} GB vs materialized dict)"
+        )
+        return vmap, samples_sum
 
     @dlp.log
     def reconfigure(self, epoch_number):
@@ -1038,10 +1170,27 @@ def _apply_env_overrides(args: 'ConfigArguments', dotenv: dict) -> None:
       DLIO_DATA_GEN        — data-generation backend: 'dgen', 'numpy', or
                              'auto' (default).  Also honoured in
                              derive_configurations() for backward compat.
+
+    Storage env vars (Issue 9 — standalone object-storage usability):
+
+      DLIO_STORAGE_LIBRARY — storage_options['storage_library']:
+                             'minio', 's3dlio', 's3torchconnector', etc.
+      DLIO_BUCKET          — storage_root: S3 bucket / container name.
+      DLIO_STORAGE_TYPE    — storage_type: 's3', 'local_fs', 'aistore', etc.
+      AWS_ACCESS_KEY_ID    — storage_options['access_key_id']
+      AWS_SECRET_ACCESS_KEY— storage_options['secret_access_key']
+      AWS_ENDPOINT_URL     — storage_options['endpoint_url']
+      AWS_REGION           — storage_options['region']
+
+    All storage env vars are optional and only fill in fields that are not
+    already set by YAML / CLI.  Standard AWS_* names are reused so that a
+    single .env file works both with dlio_benchmark and with the AWS CLI.
     """
     def _getenv(key: str):
         """Return key from os.environ (higher priority) or .env file."""
         return os.environ.get(key) or dotenv.get(key)
+
+    # ── output / data-gen ──────────────────────────────────────────────────
 
     # output_folder: fill in only if not already set by YAML/CLI
     if args.output_folder is None:
@@ -1054,6 +1203,45 @@ def _apply_env_overrides(args: 'ConfigArguments', dotenv: dict) -> None:
         v = _getenv('DLIO_DATA_GEN')
         if v:
             args.data_gen_method = v.lower()
+
+    # ── storage env vars (Issue 9) ─────────────────────────────────────────
+    # Each variable is only applied when the corresponding field is still at
+    # its "unset" sentinel value (None / default), so explicit YAML/CLI
+    # values always win.
+
+    # storage_type
+    if args.storage_type is None:
+        v = _getenv('DLIO_STORAGE_TYPE')
+        if v:
+            from dlio_benchmark.common.enumerations import StorageType
+            try:
+                args.storage_type = StorageType(v.lower())
+            except ValueError:
+                pass
+
+    # storage_root (bucket)
+    if args.storage_root is None:
+        v = _getenv('DLIO_BUCKET')
+        if v:
+            args.storage_root = v
+
+    # storage_options dict — lazily allocated on first use
+    _so_updates = {
+        'DLIO_STORAGE_LIBRARY': 'storage_library',
+        'AWS_ACCESS_KEY_ID':    'access_key_id',
+        'AWS_SECRET_ACCESS_KEY':'secret_access_key',
+        'AWS_ENDPOINT_URL':     'endpoint_url',
+        'AWS_REGION':           'region',
+    }
+    for env_key, opt_key in _so_updates.items():
+        v = _getenv(env_key)
+        if v:
+            if args.storage_options is None:
+                # First storage env var seen — create the dict
+                args.storage_options = {}
+            # Only fill if the key is not already set by YAML/CLI
+            if opt_key not in args.storage_options:
+                args.storage_options[opt_key] = v
 
 
 def LoadConfig(args, config):
@@ -1082,6 +1270,8 @@ def LoadConfig(args, config):
             if args.storage_options is None:
                 args.storage_options = {}
             args.storage_options['storage_library'] = config['storage']['storage_library']
+        if 'post_generation_settle_seconds' in config['storage']:
+            args.post_generation_settle_seconds = float(config['storage']['post_generation_settle_seconds'])
 
     # dataset related settings
     if 'dataset' in config:
@@ -1172,6 +1362,8 @@ def LoadConfig(args, config):
             args.data_loader_sampler = DataLoaderSampler(reader['data_loader_sampler'])
         if 'read_threads' in reader:
             args.read_threads = reader['read_threads']
+        if 'write_threads' in reader:
+            args.write_threads = reader['write_threads']
         if 'computation_threads' in reader:
             args.computation_threads = reader['computation_threads']
         if 'batch_size' in reader:

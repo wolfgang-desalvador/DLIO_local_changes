@@ -174,10 +174,11 @@ class StatsCounter(object):
                     elif t.find("load_ckpt")!=-1:
                         duration_load.append(float(self.per_epoch_stats[e][t]['duration']))
                         io_load.append(self.per_epoch_stats[e][t]['throughput'])
-            self.summary['metric']['save_checkpoint_io_mean_GB_per_second'] = np.mean(io_save)
-            self.summary['metric']['save_checkpoint_io_stdev_GB_per_second'] = np.std(io_save)
-            self.summary['metric']['save_checkpoint_duration_mean_seconds'] = np.mean(duration_save)
-            self.summary['metric']['save_checkpoint_duration_stdev_seconds'] = np.std(duration_save)
+            if len(io_save) > 0:
+                self.summary['metric']['save_checkpoint_io_mean_GB_per_second'] = np.mean(io_save)
+                self.summary['metric']['save_checkpoint_io_stdev_GB_per_second'] = np.std(io_save)
+                self.summary['metric']['save_checkpoint_duration_mean_seconds'] = np.mean(duration_save)
+                self.summary['metric']['save_checkpoint_duration_stdev_seconds'] = np.std(duration_save)
             if len(io_load) > 0:
                 self.summary['metric']['load_checkpoint_io_mean_GB_per_second'] = np.mean(io_load)
                 self.summary['metric']['load_checkpoint_io_stdev_GB_per_second'] = np.std(io_load)

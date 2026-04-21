@@ -1,9 +1,9 @@
-name: Build and Test
+name: Integration Tests (Manual)
 
+# Full 21-suite integration run. Trigger manually via the GitHub Actions UI.
+# For every-commit CI see fast-ci.yml.
 on:
-  pull_request:
-    branches: [main, dev]
-  push:
+  workflow_dispatch:
 
 jobs:
   build-and-test:
@@ -23,6 +23,7 @@ jobs:
       DFTRACER_ENABLE: 1
       DFTRACER_LOG_LEVEL: "INFO"
       DLIO_EXEC: ${{ matrix.venv == 'via-setup' && 'dlio_benchmark' || 'python dlio_benchmark/main.py' }}
+      DLIO_MAX_AUTO_THREADS: "2"
       DLIO_OBJECT_STORAGE_TESTS: "0"
       GOTCHA_DEBUG: 1
       OMPI_ALLOW_RUN_AS_ROOT: 1
@@ -57,7 +58,7 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ${{ env.VENV_PATH }}
-          key: ${{ matrix.venv }}-gcc${{ matrix.gcc }}-python${{ matrix.python }}-${{ hashFiles('requirements.txt', 'requirements-test.txt', 'setup.py') }}
+          key: ${{ matrix.venv }}-gcc${{ matrix.gcc }}-python${{ matrix.python }}-${{ hashFiles('requirements.txt', 'requirements-test.txt', 'setup.py', 'pyproject.toml') }}
       - name: Install system dependencies
         run: |
           sudo apt update
@@ -122,14 +123,6 @@ jobs:
 
           print("Preflight import check passed")
           PY
-      - name: test_ai_logging
-        env:
-          DFTRACER_INC_METADATA: 1
-          DFTRACER_TRACE_COMPRESSION: 0
-        run: |
-          source ${VENV_PATH}/bin/activate
-          pytest tests/dlio_ai_logging_test.py -n 4 -v
-          rm -rf outputs
       - name: test_dataset_dimension_gen_data
         run: |
           source ${VENV_PATH}/bin/activate

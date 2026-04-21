@@ -28,8 +28,14 @@ import subprocess
 import logging
 import os
 from dlio_benchmark.utils.config import ConfigArguments
-from dlio_benchmark.utils.utility import DLIOMPI
+from dlio_benchmark.utils.utility import DLIOMPI, DFTRACER_ENABLE
 import dlio_benchmark
+try:
+    import nvidia.dali
+    DALI_AVAILABLE = True
+except ImportError:
+    DALI_AVAILABLE = False
+requires_dali = pytest.mark.skipif(not DALI_AVAILABLE, reason="nvidia-dali not installed")
 from tests.utils import TEST_TIMEOUT_SECONDS
 
 config_dir=os.path.dirname(dlio_benchmark.__file__)+"/configs/"
@@ -55,8 +61,26 @@ def init():
     DLIOMPI.get_instance().initialize()
 
 def finalize():
-    # DLIOMPI.get_instance().finalize()
-    pass
+    # Reset ALL singletons that hold stale per-benchmark state.
+    # Checkpointing and framework singletons cache ConfigArguments values
+    # (model layers, optimization groups, …) from the previous test run.
+    # If they are not reset, the *next* test reuses the old instance and
+    # writes the wrong number of checkpoint files (test_checkpoint_step
+    # assertion failure after any test_checkpoint_epoch variant).
+    #
+    # We intentionally do NOT call MPI.Finalize(); MPI can only be
+    # initialized once per process, so we only clear the DLIOMPI wrapper.
+    from dlio_benchmark.checkpointing.pytorch_checkpointing import PyTorchCheckpointing
+    from dlio_benchmark.checkpointing.tf_checkpointing import TFCheckpointing
+    from dlio_benchmark.checkpointing.pytorch_obj_store_checkpointing import PyTorchObjStoreCheckpointing
+    from dlio_benchmark.framework.torch_framework import TorchFramework
+    from dlio_benchmark.framework.tf_framework import TFFramework
+    PyTorchCheckpointing._PyTorchCheckpointing__instance = None
+    TFCheckpointing._TFCheckpointing__instance = None
+    PyTorchObjStoreCheckpointing._PyTorchObjStoreCheckpointing__instance = None
+    TorchFramework._TorchFramework__instance = None
+    TFFramework._TFFramework__instance = None
+    DLIOMPI.reset()
 
 def clean(storage_root="./") -> None:
     comm.Barrier()
@@ -556,6 +580,8 @@ def test_pytorch_multiprocessing_context(nt, context) -> None:
                                             ("mmap_indexed_binary", "pytorch", "dali", False),
                                             ])
 def test_train(fmt, framework, dataloader, is_even) -> None:
+    if dataloader == "dali" and not DALI_AVAILABLE:
+        pytest.skip("nvidia-dali not installed")
     init()
     clean()
     if is_even:
@@ -579,7 +605,7 @@ def test_train(fmt, framework, dataloader, is_even) -> None:
                                                        f'++workload.dataset.num_files_train={num_files}', \
                                                        '++workload.reader.read_threads=1'])
         benchmark = run_benchmark(cfg)
-    #clean()
+    clean()
     finalize()
 
 

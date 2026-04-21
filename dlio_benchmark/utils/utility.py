@@ -37,12 +37,64 @@ except ImportError:
     dgen_py = None
 
 from dlio_benchmark.common.enumerations import MPIState
-from dftracer.python import (
-    dftracer as PerfTrace,
-    dft_fn as Profile,
-    ai as dft_ai,
-    DFTRACER_ENABLE
-)
+
+# Try to load dftracer. If DFTRACER_ENABLE=1 is set and the library is installed,
+# use the real dftracer decorators so .pfw trace files are written.
+# Fall back to no-op stubs when the library is absent or DFTRACER_ENABLE is not set.
+try:
+    from dftracer.python import (
+        dftracer as PerfTrace,
+        dft_fn as Profile,
+        ai as dft_ai,
+        DFTRACER_ENABLE,
+    )
+except Exception:
+    DFTRACER_ENABLE = False
+
+    class _NoOpFn:
+        """No-op stub for dft_fn (Profile context manager / decorator)."""
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def __getattr__(self, name): return _NoOpFn()
+        def __call__(self, fn=None, *args, **kwargs):
+            if callable(fn):
+                return fn
+            if fn is not None:
+                return fn   # pass iterables through (e.g. dft_ai.x.iter(iterable))
+            return self
+        def log(self, fn=None, *args, **kwargs):
+            if callable(fn): return fn
+            return lambda f: f
+        def log_init(self, fn=None, *args, **kwargs):
+            if callable(fn): return fn
+            return lambda f: f
+        def update(self, *args, **kwargs): pass
+
+    class _NoOpTracer:
+        """No-op stub for dftracer singleton."""
+        @staticmethod
+        def get_instance(): return _NoOpTracer()
+        def initialize(self, *a, **kw): pass
+        def finalize(self, *a, **kw): pass
+        def get_time(self): return 0
+        def enter_event(self): pass
+        def exit_event(self): pass
+        def log_event(self, *a, **kw): pass
+        def log_metadata_event(self, *a, **kw): pass
+
+    class _NoOpAI:
+        """No-op stub for dft_ai — supports @dft_ai, @dft_ai.x.y, dft_ai.x.iter(it)."""
+        def __call__(self, fn=None, *args, **kwargs):
+            if callable(fn): return fn
+            if fn is not None: return fn
+            return self
+        def __getattr__(self, name): return _NoOpFn()
+        def update(self, *args, **kwargs): pass
+
+    Profile = _NoOpFn
+    PerfTrace = _NoOpTracer
+    dft_ai = _NoOpAI()
 
 LOG_TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
 
@@ -201,6 +253,24 @@ class DLIOMPI:
             raise Exception(f"method {self.classname()}.size() called before initializing MPI")
         else:
             return self.mpi_ppn_list[self.mpi_node]
+
+    def ranks_per_node(self) -> int:
+        """Number of MPI ranks sharing this physical node.
+
+        Equivalent to npernode() in MPI_INITIALIZED state, but safe to call
+        in CHILD_INITIALIZED state (where full topology is unavailable) —
+        falls back to total comm_size as a conservative estimate.
+        """
+        if self.mpi_state == MPIState.UNINITIALIZED:
+            raise Exception(f"method {self.classname()}.ranks_per_node() called before initializing MPI")
+        elif self.mpi_state == MPIState.CHILD_INITIALIZED:
+            # Child processes don't run through initialize(), so mpi_ppn_list
+            # is not set.  Return comm_size as a conservative fallback so that
+            # auto-sizing formulas (cpu_count // ranks_per_node) don't over-allocate.
+            return self.mpi_size
+        else:
+            return self.mpi_ppn_list[self.mpi_node]
+
     def nnodes(self):
         if self.mpi_state == MPIState.UNINITIALIZED:
             raise Exception(f"method {self.classname()}.size() called before initializing MPI")
@@ -239,19 +309,70 @@ def timeit(func):
     return wrapper
 
 
+# Module-level state for the Rich progress bar used by progress()
+_rich_progress_instance = None
+_rich_progress_task_id = None
+
+
 def progress(count, total, status=''):
+    """Display a progress bar for data generation operations.
+
+    Uses Rich when available (provides a proper animated spinner/bar), otherwise
+    falls back to plain stdout writing.  The ``\\r``-in-logger approach used
+    previously was unreliable in non-interactive terminals and log files.
     """
-    Printing a progress bar. Will be in the stdout when debug mode is turned on
-    """
-    bar_len = 60
-    filled_len = int(round(bar_len * count / float(total)))
-    percents = round(100.0 * count / float(total), 1)
-    bar = '=' * filled_len + ">" + '-' * (bar_len - filled_len)
-    if DLIOMPI.get_instance().rank() == 0:
-        DLIOLogger.get_instance().info("\r[INFO] {} {}: [{}] {}% {} of {} ".format(utcnow(), status, bar, percents, count, total))
-        if count == total:
-            DLIOLogger.get_instance().info("")
+    global _rich_progress_instance, _rich_progress_task_id
+
+    if DLIOMPI.get_instance().rank() != 0:
+        return
+
+    try:
+        from rich.progress import (
+            BarColumn, Progress, SpinnerColumn,
+            TextColumn, TimeElapsedColumn,
+        )
+
+        # Create a fresh progress bar at the start of a new sequence
+        if _rich_progress_instance is None or count == 1:
+            if _rich_progress_instance is not None:
+                try:
+                    _rich_progress_instance.stop()
+                except Exception:
+                    pass
+            _rich_progress_instance = Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.completed}/{task.total}"),
+                TimeElapsedColumn(),
+                transient=True,
+            )
+            _rich_progress_instance.start()
+            _rich_progress_task_id = _rich_progress_instance.add_task(
+                status, total=total
+            )
+
+        _rich_progress_instance.update(
+            _rich_progress_task_id, completed=count, description=status
+        )
+
+        if count >= total:
+            _rich_progress_instance.stop()
+            _rich_progress_instance = None
+            _rich_progress_task_id = None
+
+    except Exception:
+        # Fallback: write directly to stdout (no \r in log messages)
+        bar_len = 60
+        filled_len = int(round(bar_len * count / float(total)))
+        percents = round(100.0 * count / float(total), 1)
+        bar = '=' * filled_len + ">" + '-' * (bar_len - filled_len - 1)
+        end = '\n' if count >= total else ''
+        os.sys.stdout.write(
+            f"\r[{bar}] {percents:.1f}%  {count}/{total}  {status}{end}"
+        )
         os.sys.stdout.flush()
+
 
 
 def str2bool(v):

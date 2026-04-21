@@ -1,26 +1,14 @@
 import os
 import pytest
 
-# Hard-disable object-storage tests. If a command targets them via -k,
-# exit immediately with code 0 so mpirun does not report an error.
-SKIP_OBJECT_TESTS = True
-
-
-def _is_object_storage_keyword(expr):
-    if not expr:
-        return False
-    return "test_s3_" in expr or "test_aistore_" in expr
-
-
-def pytest_sessionstart(session):
-    if not SKIP_OBJECT_TESTS:
-        return
-    keyword = session.config.option.keyword
-    if _is_object_storage_keyword(keyword):
-        pytest.exit(
-            "Object-storage tests are disabled by default.",
-            returncode=0,
-        )
+# Object-storage tests are disabled unless DLIO_OBJECT_STORAGE_TESTS=1 is set.
+# Each object-storage test module also enforces this with a module-level
+# pytest.skip(), so these tests are safe to collect without an object-storage
+# endpoint — they simply skip.
+#
+# CI sets DLIO_OBJECT_STORAGE_TESTS=0 explicitly so the value is never missing
+# from the build log.  Developers with a live endpoint set it to 1.
+OBJECT_STORAGE_TESTS_ENABLED = os.environ.get("DLIO_OBJECT_STORAGE_TESTS", "0") == "1"
 
 # Named output directory for all DLIO benchmark tests.
 # Prevents DLIO from creating an ambiguous 'output/' folder in the working
@@ -33,6 +21,11 @@ DLIO_TEST_OUTPUT_DIR = os.environ.get('DLIO_TEST_OUTPUT_DIR', _DEFAULT_TEST_OUTP
 # up for every DLIOBenchmark instantiation, including standalone calls that
 # don't go through a test-local run_benchmark() wrapper.
 os.environ.setdefault('DLIO_OUTPUT_FOLDER', DLIO_TEST_OUTPUT_DIR)
+
+# Cap auto-sized thread counts during tests so the suite runs predictably on
+# small CI runners (GitHub Actions: 2 cores) and doesn't saturate large dev
+# machines.  Set DLIO_MAX_AUTO_THREADS in the environment to override.
+os.environ.setdefault('DLIO_MAX_AUTO_THREADS', '2')
 
 
 # HACK: to fix the reinitialization problem
